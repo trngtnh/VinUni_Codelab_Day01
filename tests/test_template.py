@@ -203,11 +203,42 @@ class TestRetryWithBackoff(unittest.TestCase):
             retry_with_backoff(permanent_fail, max_retries=2, base_delay=0.001)
 
 
+    def test_retry_count_and_exponential_delays(self):
+        error = RuntimeError("Permanent failure")
+        fn = MagicMock(side_effect=error)
+
+        with patch.object(_m.time, "sleep") as sleep:
+            with self.assertRaises(RuntimeError) as raised:
+                retry_with_backoff(fn, max_retries=3, base_delay=0.25)
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(fn.call_count, 4)
+        self.assertEqual(
+            [args[0] for args, kwargs in sleep.call_args_list],
+            [0.25, 0.5, 1.0],
+        )
+
+    def test_zero_retries_calls_once_without_sleeping(self):
+        fn = MagicMock(side_effect=ValueError("Fail"))
+        with patch.object(_m.time, "sleep") as sleep:
+            with self.assertRaises(ValueError):
+                retry_with_backoff(fn, max_retries=0)
+        fn.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_success_does_not_sleep_or_retry(self):
+        fn = MagicMock(return_value="done")
+        with patch.object(_m.time, "sleep") as sleep:
+            self.assertEqual(retry_with_backoff(fn), "done")
+        fn.assert_called_once_with()
+        sleep.assert_not_called()
+
+
 class TestBatchCompareAndFormat(unittest.TestCase):
 
     def test_batch_runs_and_formats_table(self):
         with patch.object(_m, "compare_models") as mock_comp:
-            def _get_mock():
+            def _get_mock(prompt):
                 return {
                     "gpt4o": {"response": "GPT-4o response content here", "latency": 0.5, "cost": 0.00045, "input_tokens": 10, "output_tokens": 20},
                     "gpt4o_mini": {"response": "GPT-4o-Mini response content here", "latency": 0.3, "cost": 0.0000135, "input_tokens": 10, "output_tokens": 20},
@@ -225,6 +256,48 @@ class TestBatchCompareAndFormat(unittest.TestCase):
             self.assertIn("GPT-4o", table)
             self.assertIn("Gemini-Flash", table)
             self.assertIn("Q1", table)
+
+
+    def test_batch_forwards_prompts_without_mutating_comparisons(self):
+        comparison = {"gpt4o": {"response": "Original"}}
+        with patch.object(_m, "compare_models", return_value=comparison) as compare:
+            results = batch_compare(["First", "Second"])
+
+        self.assertEqual([args[0] for args, kwargs in compare.call_args_list], ["First", "Second"])
+        self.assertEqual([row["prompt"] for row in results], ["First", "Second"])
+        self.assertNotIn("prompt", comparison)
+        self.assertIsNot(results[0], results[1])
+
+    def test_empty_batch_does_not_call_models(self):
+        with patch.object(_m, "compare_models") as compare:
+            self.assertEqual(batch_compare([]), [])
+        compare.assert_not_called()
+        self.assertEqual(len(format_comparison_table([]).splitlines()), 2)
+
+    def test_table_escapes_cells_truncates_and_formats_numbers(self):
+        stats = {
+            "response": "A" * 60,
+            "latency": 0.123,
+            "input_tokens": 12,
+            "output_tokens": 25,
+            "cost": 0.00000675,
+        }
+        result = {
+            "prompt": "Question|one\nnext line",
+            "gpt4o": stats,
+            "gpt4o_mini": {**stats, "response": "Answer|two\nnext line"},
+            "gemini_flash": stats,
+        }
+        table = format_comparison_table([result])
+        self.assertEqual(len(table.splitlines()), 5)
+        self.assertIn("Question\\|one next line", table)
+        self.assertIn("Answer\\|two next line", table)
+        self.assertIn("A" * 47 + "...", table)
+        self.assertNotIn("A" * 51, table)
+        self.assertIn("0.12s", table)
+        self.assertIn("12/25", table)
+        self.assertIn("$0.00000675", table)
+        self.assertEqual(result["gpt4o"]["response"], "A" * 60)
 
 
 class TestStreamingChatbot(unittest.TestCase):
